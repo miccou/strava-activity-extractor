@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Strava Activity Extractor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      pre::-webkit-scrollbar {
+        width: 6px;
+        height: 6px;
+      }
+      pre::-webkit-scrollbar-track {
+        background: #f3f4f6;
+        border-radius: 3px;
+      }
+      pre::-webkit-scrollbar-thumb {
+        background: #f97316;
+        border-radius: 3px;
+      }
+      .type-btn {
+        transition: all 0.15s;
+      }
+      .type-btn.active {
+        background: #fff7ed;
+        border-color: #f97316;
+        color: #c2410c;
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body class="bg-gray-50 text-gray-800 antialiased">
+    <div class="max-w-6xl mx-auto px-4 py-10 space-y-5">
+      <!-- Header -->
+      <div>
+        <h1 class="text-2xl font-bold text-orange-600">
+          Strava Activity Extractor
+        </h1>
+        <p class="text-sm text-gray-500 mt-1">
+          Pull your Strava activities and format them for LLMs — no API keys
+          required.
+        </p>
+      </div>
+
+      <!-- Step 1 – cURL command -->
+      <div class="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center gap-2 mb-3">
+          <span
+            class="text-xs font-bold bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full"
+            >STEP 1</span
+          >
+          <h2 class="font-semibold text-sm">Paste a cURL command</h2>
+        </div>
+        <p class="text-xs text-gray-500 mb-3 leading-relaxed">
+          Open
+          <a
+            href="https://www.strava.com/athlete/training"
+            target="_blank"
+            class="text-orange-500 hover:underline"
+            >strava.com/athlete/training</a
+          >
+          while logged in. Open DevTools → <strong>Network</strong> tab, reload
+          the page, then find a request to
+          <code class="bg-gray-100 px-1 rounded">training_activities</code>.
+          Right-click it → <em>Copy</em> → <em>Copy as cURL</em> and paste
+          below.
+        </p>
+        <textarea
+          id="curlInput"
+          rows="5"
+          spellcheck="false"
+          class="w-full font-mono text-xs bg-gray-50 border border-gray-200 rounded-xl p-3 focus:outline-none focus:ring-2 focus:ring-orange-300 focus:border-transparent resize-y"
+          placeholder="curl 'https://www.strava.com/athlete/training_activities?...' \&#10;  -H 'Cookie: _strava4_session=...' \&#10;  -H 'X-CSRF-Token: ...' ..."
+        ></textarea>
+      </div>
+
+      <!-- Step 2 – Filters -->
+      <div class="bg-white border border-gray-200 rounded-2xl p-5 shadow-sm">
+        <div class="flex items-center gap-2 mb-4">
+          <span
+            class="text-xs font-bold bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full"
+            >STEP 2</span
+          >
+          <h2 class="font-semibold text-sm">Configure filters</h2>
+        </div>
+
+        <!-- Date range -->
+        <div class="grid grid-cols-2 gap-3 mb-3">
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1"
+              >From</label
+            >
+            <input
+              type="date"
+              id="startDate"
+              class="w-full text-sm border border-gray-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-300"
+            />
+          </div>
+          <div>
+            <label class="block text-xs font-medium text-gray-600 mb-1"
+              >To</label
+            >
+            <input
+              type="date"
+              id="endDate"
+              class="w-full text-sm border border-gray-200 rounded-xl px-3 py-2 focus:outline-none focus:ring-2 focus:ring-orange-300"
+            />
+          </div>
+        </div>
+
+        <!-- Quick presets -->
+        <div class="flex flex-wrap gap-2 mb-4 text-xs">
+          <span class="text-gray-400 self-center">Quick select:</span>
+          <button
+            onclick="setRange(7)"
+            class="preset-btn px-2 py-1 bg-gray-100 hover:bg-orange-100 hover:text-orange-700 rounded-lg"
+          >
+            7 days
+          </button>
+          <button
+            onclick="setRange(30)"
+            class="preset-btn px-2 py-1 bg-gray-100 hover:bg-orange-100 hover:text-orange-700 rounded-lg"
+          >
+            30 days
+          </button>
+          <button
+            onclick="setRange(90)"
+            class="preset-btn px-2 py-1 bg-gray-100 hover:bg-orange-100 hover:text-orange-700 rounded-lg"
+          >
+            90 days
+          </button>
+          <button
+            onclick="setRange(365)"
+            class="preset-btn px-2 py-1 bg-gray-100 hover:bg-orange-100 hover:text-orange-700 rounded-lg"
+          >
+            1 year
+          </button>
+          <button
+            onclick="clearDates()"
+            class="preset-btn px-2 py-1 bg-gray-100 hover:bg-gray-200 rounded-lg"
+          >
+            All time
+          </button>
+        </div>
+
+        <!-- Activity type toggles -->
+        <div>
+          <label class="block text-xs font-medium text-gray-600 mb-2">
+            Activity types
+            <span class="font-normal text-gray-400">(none = all types)</span>
+          </label>
+          <div id="typeToggles" class="flex flex-wrap gap-2"></div>
+        </div>
+
+        <!-- Options -->
+        <div class="mt-4 pt-4 border-t border-gray-100">
+          <label
+            class="flex items-center gap-2 cursor-pointer select-none group"
+          >
+            <input
+              type="checkbox"
+              id="fetchDetails"
+              class="w-4 h-4 rounded text-orange-500 focus:ring-orange-300 cursor-pointer"
+            />
+            <span class="text-xs text-gray-700 group-hover:text-gray-900">
+              Fetch heartrate &amp; power per activity
+              <span class="text-gray-400">— makes 1 extra request per activity</span>
+            </span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Extract button -->
+      <button
+        id="extractBtn"
+        onclick="extract()"
+        class="w-full bg-orange-500 hover:bg-orange-600 active:bg-orange-700 text-white font-semibold py-3 rounded-2xl shadow-sm transition-colors"
+      >
+        Extract Activities
+      </button>
+
+      <!-- Status message -->
+      <div id="statusMsg" class="hidden rounded-xl p-3 text-sm border"></div>
+
+      <!-- Output: two side-by-side boxes -->
+      <div
+        id="outputSection"
+        class="hidden"
+        style="
+          display: none;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 1rem;
+        "
+      >
+        <!-- Compact -->
+        <div
+          class="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden flex flex-col"
+        >
+          <div
+            class="flex items-center justify-between px-4 py-2.5 border-b border-gray-100"
+          >
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-sm">Compact</span>
+              <span
+                id="countBadge"
+                class="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium"
+              ></span>
+            </div>
+            <button
+              onclick="copyBox('compactText')"
+              class="text-xs bg-gray-100 hover:bg-gray-200 active:bg-gray-300 px-3 py-1 rounded-lg font-medium transition-colors"
+            >
+              Copy
+            </button>
+          </div>
+          <pre
+            id="compactText"
+            class="p-4 text-xs leading-relaxed overflow-auto h-[520px] whitespace-pre-wrap font-mono bg-gray-50 flex-1"
+          ></pre>
+        </div>
+
+        <!-- Detailed -->
+        <div
+          class="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden flex flex-col"
+        >
+          <div
+            class="flex items-center justify-between px-4 py-2.5 border-b border-gray-100"
+          >
+            <span class="font-semibold text-sm">Detailed</span>
+            <button
+              onclick="copyBox('detailedText')"
+              class="text-xs bg-gray-100 hover:bg-gray-200 active:bg-gray-300 px-3 py-1 rounded-lg font-medium transition-colors"
+            >
+              Copy
+            </button>
+          </div>
+          <pre
+            id="detailedText"
+            class="p-4 text-xs leading-relaxed overflow-auto h-[520px] whitespace-pre-wrap font-mono bg-gray-50 flex-1"
+          ></pre>
+        </div>
+      </div>
+
+
+    </div>
+
+    <script>
+      // -----------------------------------------------------------------------
+      // Activity type definitions
+      // -----------------------------------------------------------------------
+      const TYPES = [
+        { id: "Run", label: "🏃 Run" },
+        { id: "TrailRun", label: "🌲 Trail Run" },
+        { id: "VirtualRun", label: "🎮 Virtual Run" },
+        { id: "Ride", label: "🚴 Ride" },
+        { id: "GravelRide", label: "🪨 Gravel" },
+        { id: "MountainBikeRide", label: "⛰️ MTB" },
+        { id: "VirtualRide", label: "🎮 Virtual Ride" },
+        { id: "EBikeRide", label: "⚡ E-Bike" },
+        { id: "Swim", label: "🏊 Swim" },
+        { id: "Walk", label: "🚶 Walk" },
+        { id: "Hike", label: "🥾 Hike" },
+        { id: "WeightTraining", label: "🏋️ Weights" },
+        { id: "Yoga", label: "🧘 Yoga" },
+        { id: "Workout", label: "💪 Workout" },
+        { id: "Rowing", label: "🚣 Rowing" },
+        { id: "AlpineSki", label: "⛷️ Ski" },
+      ];
+
+      const selectedTypes = new Set();
+
+      function initToggles() {
+        const container = document.getElementById("typeToggles");
+        TYPES.forEach((t) => {
+          const btn = document.createElement("button");
+          btn.textContent = t.label;
+          btn.dataset.id = t.id;
+          btn.className =
+            "type-btn px-3 py-1 text-xs rounded-full border border-gray-200 hover:border-orange-300";
+          btn.addEventListener("click", () => {
+            if (selectedTypes.has(t.id)) {
+              selectedTypes.delete(t.id);
+              btn.classList.remove("active");
+            } else {
+              selectedTypes.add(t.id);
+              btn.classList.add("active");
+            }
+          });
+          container.appendChild(btn);
+        });
+      }
+
+      // -----------------------------------------------------------------------
+      // Date helpers
+      // -----------------------------------------------------------------------
+      function toISO(d) {
+        return d.toISOString().slice(0, 10);
+      }
+
+      function setRange(days) {
+        const end = new Date();
+        const start = new Date(+end - days * 86_400_000);
+        document.getElementById("endDate").value = toISO(end);
+        document.getElementById("startDate").value = toISO(start);
+      }
+
+      function clearDates() {
+        document.getElementById("startDate").value = "";
+        document.getElementById("endDate").value = "";
+      }
+
+      // -----------------------------------------------------------------------
+      // Status display
+      // -----------------------------------------------------------------------
+      function showStatus(msg, type) {
+        const el = document.getElementById("statusMsg");
+        const map = {
+          info: "bg-blue-50  text-blue-700  border-blue-100",
+          success: "bg-green-50 text-green-700 border-green-100",
+          error: "bg-red-50   text-red-700   border-red-100",
+        };
+        el.className = `rounded-xl p-3 text-sm border ${map[type] || map.info}`;
+        el.textContent = msg;
+        el.classList.remove("hidden");
+      }
+
+      // -----------------------------------------------------------------------
+      // Copy individual box
+      // -----------------------------------------------------------------------
+      function copyBox(elId) {
+        const text = document.getElementById(elId).textContent;
+        navigator.clipboard.writeText(text).catch(() => {
+          const ta = document.createElement("textarea");
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+        });
+      }
+
+      // -----------------------------------------------------------------------
+      // Main extract handler
+      // -----------------------------------------------------------------------
+      async function extract() {
+        const curl = document.getElementById("curlInput").value.trim();
+        if (!curl) {
+          showStatus("Please paste a cURL command first.", "error");
+          return;
+        }
+
+        const btn = document.getElementById("extractBtn");
+        btn.disabled = true;
+        btn.textContent = "Fetching…";
+        showStatus(
+          "Fetching activities from Strava — this may take a moment for large date ranges…",
+          "info",
+        );
+
+        try {
+          const res = await fetch("/api/fetch-activities", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              curl,
+              start_date: document.getElementById("startDate").value || null,
+              end_date: document.getElementById("endDate").value || null,
+              sport_types: [...selectedTypes],
+              fetch_details: document.getElementById("fetchDetails").checked,
+            }),
+          });
+
+          const data = await res.json();
+          if (!res.ok) {
+            showStatus(`Error: ${data.error || "Unknown error"}`, "error");
+            return;
+          }
+
+          document.getElementById("compactText").textContent = data.compact;
+          document.getElementById("detailedText").textContent = data.formatted;
+          document.getElementById("countBadge").textContent =
+            `${data.count} activities`;
+          document.getElementById("outputSection").style.display = "grid";
+          showStatus(`Done! Extracted ${data.count} activities.`, "success");
+          document
+            .getElementById("outputSection")
+            .scrollIntoView({ behavior: "smooth", block: "start" });
+        } catch (err) {
+          showStatus(`Unexpected error: ${err.message}`, "error");
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Extract Activities";
+        }
+      }
+
+      // -----------------------------------------------------------------------
+      // Initialise
+      // -----------------------------------------------------------------------
+      initToggles();
+      setRange(30); // default to last 30 days
+    </script>
+  </body>
+</html>
