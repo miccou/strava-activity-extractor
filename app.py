@@ -492,7 +492,7 @@ def fetch_activities(
 
             results.append(act)
 
-        if stop or len(page_acts) < 30:
+        if stop:
             break
 
         time.sleep(0.15)
