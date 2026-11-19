@@ -51,6 +51,10 @@ Open **http://localhost:5000** in your browser.
 5. Click **Extract Activities**.
 6. Copy the formatted output and paste it into your LLM of choice.
 
+Activities appear in the output boxes as they're fetched. A **Strava requests** log above them shows each call as it's made.
+
+> **Rate limiting:** If Strava responds with `429 Too Many Requests` (or a temporary 5xx error), the app waits and retries automatically, up to 5 times. A banner shows which retry it is and counts down the wait. It follows Strava's `Retry-After` header when one is sent; otherwise the wait doubles each time (~2s, 4s, 8s, 16s, 32s). After a 429, it also adds extra spacing between all later requests (1s, doubling with each further 429, up to 16s), which shrinks again as requests succeed. If Strava is still limiting after 5 retries, or asks for a wait longer than 2 minutes, the run stops and you keep the activities fetched so far. Large date ranges with "Fetch full details" turned on are the most likely to hit the limit.
+
 ---
 
 ## Output format

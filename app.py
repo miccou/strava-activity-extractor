@@ -1,11 +1,14 @@
+import email.utils
 import json
+import math
+import random
 import re
 import uuid
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 app = Flask(__name__)
 
@@ -339,8 +342,164 @@ def format_all(activities: list) -> str:
     header = f"# Strava Activities ({len(activities)} total)\n"
     blocks = [header]
     for i, act in enumerate(activities, 1):
-        blocks.append(f"---\n### {i}.\n{format_activity(act)}\n")
+        blocks.append(format_block(i, act))
     return "\n".join(blocks)
+
+
+def format_block(i: int, act: dict) -> str:
+    return f"---\n### {i}.\n{format_activity(act)}\n"
+
+
+# ---------------------------------------------------------------------------
+# HTTP with rate-limit backoff
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES = 5           # retries after the initial attempt
+BACKOFF_BASE = 2.0        # seconds; doubles on each retry
+BACKOFF_CAP = 60.0        # longest single wait when Strava sends no Retry-After
+MAX_RETRY_AFTER = 120.0   # give up instead of waiting longer than this
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+PACE_STEP = 1.0           # extra gap between requests after the first 429
+PACE_MAX = 16.0           # extra gap never grows beyond this
+PACE_DECAY = 0.8          # each successful request shrinks the extra gap by 20%
+
+
+class RateLimitError(Exception):
+    """Strava is still rate-limiting us after all retries."""
+
+
+class Pacer:
+    """Extra spacing between Strava requests for the rest of a run.
+
+    Each 429 doubles it (1s, 2s, 4s … PACE_MAX); each successful request
+    eases it back, so after hitting the limit we don't go straight back to
+    full speed and trip it again.
+    """
+
+    def __init__(self):
+        self.extra = 0.0
+
+    def slow_down(self):
+        self.extra = min(PACE_MAX, max(PACE_STEP, self.extra * 2))
+
+    def ease(self):
+        self.extra *= PACE_DECAY
+        if self.extra < 0.1:
+            self.extra = 0.0
+
+    def sleep(self, base: float):
+        time.sleep(base + self.extra)
+
+
+def _retry_after_seconds(resp: requests.Response) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date) into seconds."""
+    value = resp.headers.get("Retry-After")
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _backoff_delay(retry: int) -> float:
+    """Exponential backoff with a little jitter: ~2s, 4s, 8s, 16s, 32s…"""
+    delay = min(BACKOFF_CAP, BACKOFF_BASE * 2 ** (retry - 1))
+    return delay + random.uniform(0, delay * 0.25)
+
+
+def _rate_limit_message(retry_after: float | None) -> str:
+    if retry_after:
+        mins = max(1, math.ceil(retry_after / 60))
+        wait = f"in about {mins} minute{'s' if mins != 1 else ''}"
+    else:
+        wait = "in a few minutes"
+    return (
+        f"Strava rate limit reached — please try again {wait}. "
+        "Turning off \"Fetch full details\" uses far fewer requests."
+    )
+
+
+def _retry_event(url, retry, delay, source, pacer, status=None, error=None) -> dict:
+    if status == 429:
+        reason = "rate_limited"
+    elif status is not None:
+        reason = "server_error"
+    else:
+        reason = "network_error"
+    print(
+        f"[retry {retry}/{MAX_RETRIES}] {url}: {status or error}, "
+        f"sleeping {delay:.1f}s ({source})"
+    )
+    return {
+        "type": "retry",
+        "reason": reason,
+        "status": status,
+        "error": error,
+        "retry": retry,
+        "max_retries": MAX_RETRIES,
+        "delay": round(delay, 1),
+        "source": source,  # "retry-after" (Strava told us) or "backoff" (our guess)
+        "extra_gap": round(pacer.extra, 1) if pacer else 0.0,
+    }
+
+
+def strava_get(url: str, *, headers: dict, params=None, timeout: float = 30, pacer=None):
+    """GET with backoff on 429, transient 5xx and network errors.
+
+    This is a generator: it yields a "retry" event just before each backoff
+    sleep (so the UI can show it live) and returns the final Response —
+    call it as ``r = yield from strava_get(...)``.
+
+    Honours Retry-After when present, otherwise backs off exponentially.
+    Raises RateLimitError if still getting 429 after MAX_RETRIES, or if Strava
+    asks us to wait longer than MAX_RETRY_AFTER. Any other final response is
+    returned for the caller to handle. If a Pacer is given, 429s widen the gap
+    between later requests and successes narrow it again.
+    """
+    retry = 0
+    while True:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if retry == MAX_RETRIES:
+                raise
+            retry += 1
+            delay = _backoff_delay(retry)
+            yield _retry_event(url, retry, delay, "backoff", pacer, error=type(e).__name__)
+            time.sleep(delay)
+            continue
+
+        if r.status_code not in RETRY_STATUSES:
+            if pacer and r.ok:
+                pacer.ease()
+            return r
+
+        if r.status_code == 429 and pacer:
+            pacer.slow_down()
+
+        retry_after = _retry_after_seconds(r)
+        too_long = retry_after is not None and retry_after > MAX_RETRY_AFTER
+        if retry == MAX_RETRIES or too_long:
+            if r.status_code == 429:
+                raise RateLimitError(_rate_limit_message(retry_after))
+            return r
+
+        retry += 1
+        if retry_after is not None:
+            delay, source = max(1.0, retry_after), "retry-after"
+        else:
+            delay, source = _backoff_delay(retry), "backoff"
+        yield _retry_event(url, retry, delay, source, pacer, status=r.status_code)
+        time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -354,17 +513,21 @@ def build_req_headers(base: dict) -> dict:
     return h
 
 
-def fetch_activity_detail(activity_id: int, headers: dict) -> dict | None:
-    """Fetch HR, cadence and watts from the streams endpoint."""
+def fetch_activity_detail(activity_id: int, headers: dict, pacer: Pacer | None = None):
+    """Fetch HR, cadence and watts from the streams endpoint.
+
+    Generator: yields retry events, returns the extra fields dict (or None).
+    """
     req_h = build_req_headers(headers)
     extra: dict = {}
 
     try:
-        r = requests.get(
+        r = yield from strava_get(
             f"https://www.strava.com/activities/{activity_id}/streams",
             headers=req_h,
             params={"stream_types[]": ["heartrate", "cadence", "watts"]},
             timeout=20,
+            pacer=pacer,
         )
         if r.status_code == 200:
             streams = r.json()
@@ -394,6 +557,8 @@ def fetch_activity_detail(activity_id: int, headers: dict) -> dict | None:
                     extra["max_watts"] = max(numeric)
         else:
             print(f"[streams {activity_id}] status {r.status_code}")
+    except RateLimitError:
+        raise  # don't keep hammering Strava for every remaining activity
     except Exception as e:
         print(f"[streams {activity_id}] error: {e}")
 
@@ -407,10 +572,16 @@ def fetch_activities(
     end_date: date | None,
     sport_types: list[str],
     fetch_details: bool = False,
-) -> list[dict]:
+):
+    """Generator of progress events for the UI.
+
+    Yields {"type": "request", ...} before each Strava call, "retry" events
+    while backing off, and {"type": "activity", "activity": act} for each
+    matching activity as soon as it's ready.
+    """
     req_h = build_req_headers(headers)
     session_id = str(uuid.uuid4())
-    results = []
+    pacer = Pacer()
 
     # Strava only accepts a single sport_type value; filter multi-type client-side
     api_sport_type = sport_types[0] if len(sport_types) == 1 else ""
@@ -431,11 +602,13 @@ def fetch_activities(
             "per_page": "30",
         }
 
-        r = requests.get(
+        yield {"type": "request", "what": "page", "page": page, "extra_gap": round(pacer.extra, 1)}
+        r = yield from strava_get(
             "https://www.strava.com/athlete/training_activities",
             headers=req_h,
             params=params,
             timeout=30,
+            pacer=pacer,
         )
 
         if r.status_code in (401, 403):
@@ -484,20 +657,29 @@ def fetch_activities(
                 if act_sport not in sport_types:
                     continue
 
+            fetched_detail = False
             if fetch_details and act.get("id"):
-                detail = fetch_activity_detail(act["id"], headers)
+                yield {
+                    "type": "request",
+                    "what": "detail",
+                    "id": act["id"],
+                    "name": act.get("name"),
+                    "extra_gap": round(pacer.extra, 1),
+                }
+                detail = yield from fetch_activity_detail(act["id"], headers, pacer)
                 if detail:
                     act = {**act, **detail}
-                time.sleep(0.3)  # be polite when hitting detail endpoints
+                fetched_detail = True
 
-            results.append(act)
+            yield {"type": "activity", "activity": act}
+
+            if fetched_detail:
+                pacer.sleep(0.3)  # be polite when hitting detail endpoints
 
         if stop:
             break
 
-        time.sleep(0.15)
-
-    return results
+        pacer.sleep(0.15)
 
 
 # ---------------------------------------------------------------------------
@@ -534,29 +716,61 @@ def api_fetch():
     sport_types = body.get("sport_types") or []
     fetch_details = bool(body.get("fetch_details", False))
 
-    try:
-        activities = fetch_activities(
-            headers, start_date, end_date, sport_types, fetch_details
-        )
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 401
-    except requests.RequestException as e:
-        return jsonify({"error": f"Network error: {e}"}), 502
+    def stream():
+        """NDJSON: one event per line, ending with a "done" or "error" event.
 
-    if activities:
-        print("\n=== RAW SAMPLE (first activity) ===")
-        print(json.dumps(activities[0], indent=2, default=str))
-        print("==================================\n")
+        Both final events carry the full formatted text of everything fetched,
+        so a run that stops early (e.g. rate limited) still returns partial results.
+        """
+        results: list[dict] = []
 
-    return jsonify(
-        {
-            "count": len(activities),
-            "formatted": format_all(activities),
-            "compact": format_all_compact(activities),
-            "raw": activities,
-            "raw_sample": activities[0] if activities else None,
-        }
+        def final(kind: str, **extra) -> dict:
+            return {
+                "type": kind,
+                "count": len(results),
+                "formatted": format_all(results),
+                "compact": format_all_compact(results),
+                **extra,
+            }
+
+        try:
+            for ev in fetch_activities(
+                headers, start_date, end_date, sport_types, fetch_details
+            ):
+                if ev["type"] == "activity":
+                    act = ev["activity"]
+                    results.append(act)
+                    ev = {
+                        "type": "activity",
+                        "index": len(results),
+                        "compact": format_activity_compact(act),
+                        "formatted": format_block(len(results), act),
+                    }
+                yield _ndjson(ev)
+        except (RateLimitError, ValueError) as e:
+            end = final("error", error=str(e))
+        except requests.RequestException as e:
+            end = final("error", error=f"Network error: {e}")
+        except Exception as e:  # headers are already sent, so report in-stream
+            app.logger.exception("fetch failed")
+            end = final("error", error=f"Unexpected server error: {e}")
+        else:
+            end = final("done")
+            if results:
+                print("\n=== RAW SAMPLE (first activity) ===")
+                print(json.dumps(results[0], indent=2, default=str))
+                print("==================================\n")
+        yield _ndjson(end)
+
+    return Response(
+        stream(),
+        mimetype="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _ndjson(event: dict) -> str:
+    return json.dumps(event, default=str) + "\n"
 
 
 if __name__ == "__main__":

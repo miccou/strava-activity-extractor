@@ -194,6 +194,28 @@
           gap: 1rem;
         "
       >
+        <!-- Live request log (full width) -->
+        <div
+          class="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden"
+          style="grid-column: 1 / -1"
+        >
+          <div
+            class="flex items-center justify-between px-4 py-2.5 border-b border-gray-100"
+          >
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-sm">Strava requests</span>
+              <span
+                id="requestBadge"
+                class="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full font-medium"
+              ></span>
+            </div>
+          </div>
+          <div
+            id="requestLog"
+            class="px-4 py-2 text-xs leading-relaxed font-mono bg-gray-50 overflow-auto max-h-44"
+          ></div>
+        </div>
+
         <!-- Compact -->
         <div
           class="bg-white border border-gray-200 rounded-2xl shadow-sm overflow-hidden flex flex-col"
@@ -317,6 +339,7 @@
         const map = {
           info: "bg-blue-50  text-blue-700  border-blue-100",
           success: "bg-green-50 text-green-700 border-green-100",
+          warning: "bg-amber-50 text-amber-800 border-amber-200",
           error: "bg-red-50   text-red-700   border-red-100",
         };
         el.className = `rounded-xl p-3 text-sm border ${map[type] || map.info}`;
@@ -340,6 +363,182 @@
       }
 
       // -----------------------------------------------------------------------
+      // Live output helpers
+      // -----------------------------------------------------------------------
+      const run = { activities: 0, requests: 0, retries: 0, page: 0 };
+      let countdownTimer = null;
+
+      // Append to a scrollable box, following the bottom only if the user
+      // hasn't scrolled up to read something.
+      function appendTo(el, node) {
+        const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+        el.appendChild(node);
+        if (atBottom) el.scrollTop = el.scrollHeight;
+      }
+
+      function logLine(msg, kind = "info") {
+        const colors = {
+          info: "text-gray-600",
+          warn: "text-amber-700 font-semibold",
+          ok: "text-green-700 font-semibold",
+          error: "text-red-700 font-semibold",
+        };
+        const row = document.createElement("div");
+        row.className = colors[kind] || colors.info;
+        const ts = new Date().toLocaleTimeString([], { hour12: false });
+        row.textContent = `${ts}  ${msg}`;
+        appendTo(document.getElementById("requestLog"), row);
+      }
+
+      function updateBadges() {
+        document.getElementById("countBadge").textContent =
+          `${run.activities} activities`;
+        const retries = run.retries
+          ? ` · ${run.retries} retr${run.retries === 1 ? "y" : "ies"}`
+          : "";
+        document.getElementById("requestBadge").textContent =
+          `${run.requests} calls${retries}`;
+      }
+
+      function resetOutput() {
+        Object.assign(run, { activities: 0, requests: 0, retries: 0, page: 0 });
+        for (const id of ["compactText", "detailedText", "requestLog"]) {
+          document.getElementById(id).textContent = "";
+        }
+        updateBadges();
+        document.getElementById("outputSection").style.display = "grid";
+      }
+
+      function showProgress() {
+        const where = run.page ? `page ${run.page} · ` : "";
+        showStatus(
+          `Fetching from Strava… ${where}${run.activities} activities so far`,
+          "info",
+        );
+      }
+
+      function stopCountdown() {
+        clearInterval(countdownTimer);
+        countdownTimer = null;
+      }
+
+      function retryHeadline(ev) {
+        if (ev.reason === "rate_limited")
+          return "Strava API is rate limiting us (HTTP 429).";
+        if (ev.reason === "server_error")
+          return `Strava returned a server error (HTTP ${ev.status}).`;
+        return `Network error talking to Strava (${ev.error}).`;
+      }
+
+      // Rate-limit / retry banner with a live countdown until the next attempt
+      function startCountdown(ev) {
+        stopCountdown();
+        const until = Date.now() + ev.delay * 1000;
+        const why =
+          ev.source === "retry-after" ? "as requested by Strava" : "backing off";
+        const pacing =
+          ev.extra_gap > 0
+            ? ` Afterwards, requests will be spaced an extra ${ev.extra_gap}s apart.`
+            : "";
+        const render = () => {
+          const left = Math.max(0, Math.ceil((until - Date.now()) / 1000));
+          const when = left ? `retrying in ${left}s…` : "retrying now…";
+          showStatus(
+            `${retryHeadline(ev)} Retry ${ev.retry} of ${ev.max_retries}: ` +
+              `sleeping ${ev.delay}s (${why}) — ${when}${pacing}`,
+            "warning",
+          );
+        };
+        render();
+        countdownTimer = setInterval(render, 250);
+      }
+
+      function handleEvent(ev) {
+        if (ev.type !== "retry") stopCountdown();
+        const gap = ev.extra_gap > 0 ? `  (+${ev.extra_gap}s spacing)` : "";
+
+        switch (ev.type) {
+          case "request":
+            run.requests++;
+            if (ev.what === "page") {
+              run.page = ev.page;
+              logLine(`→ GET activity list, page ${ev.page}${gap}`);
+            } else {
+              logLine(`→ GET details: ${ev.name || "activity"} (#${ev.id})${gap}`);
+            }
+            showProgress();
+            break;
+
+          case "retry": {
+            run.retries++;
+            const code = ev.status ? `HTTP ${ev.status}` : ev.error;
+            const label = ev.reason === "rate_limited" ? "rate limited" : "failed";
+            const slower =
+              ev.reason === "rate_limited" && ev.extra_gap > 0
+                ? ` · slowing to +${ev.extra_gap}s between requests`
+                : "";
+            logLine(
+              `⚠ ${code} ${label} — retry ${ev.retry}/${ev.max_retries}, ` +
+                `sleeping ${ev.delay}s (${ev.source})${slower}`,
+              "warn",
+            );
+            startCountdown(ev);
+            break;
+          }
+
+          case "activity":
+            run.activities++;
+            appendTo(
+              document.getElementById("compactText"),
+              document.createTextNode(ev.compact + "\n"),
+            );
+            appendTo(
+              document.getElementById("detailedText"),
+              document.createTextNode(ev.formatted + "\n"),
+            );
+            showProgress();
+            break;
+
+          case "done":
+          case "error":
+            // Final text includes headers and is what gets copied
+            run.activities = ev.count;
+            document.getElementById("compactText").textContent = ev.compact;
+            document.getElementById("detailedText").textContent = ev.formatted;
+            if (ev.type === "done") {
+              logLine(`✓ Done — ${ev.count} activities`, "ok");
+              showStatus(`Done! Extracted ${ev.count} activities.`, "success");
+            } else {
+              logLine(`✗ ${ev.error}`, "error");
+              const partial = ev.count
+                ? ` Showing the ${ev.count} activities fetched before stopping.`
+                : "";
+              showStatus(`Error: ${ev.error}${partial}`, "error");
+            }
+            break;
+        }
+        updateBadges();
+      }
+
+      // Read a newline-delimited JSON stream, calling onEvent per line
+      async function readEvents(res, onEvent) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let nl;
+          while ((nl = buf.indexOf("\n")) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (line) onEvent(JSON.parse(line));
+          }
+        }
+      }
+
+      // -----------------------------------------------------------------------
       // Main extract handler
       // -----------------------------------------------------------------------
       async function extract() {
@@ -352,11 +551,9 @@
         const btn = document.getElementById("extractBtn");
         btn.disabled = true;
         btn.textContent = "Fetching…";
-        showStatus(
-          "Fetching activities from Strava — this may take a moment for large date ranges…",
-          "info",
-        );
+        showStatus("Connecting to Strava…", "info");
 
+        let finished = false;
         try {
           const res = await fetch("/api/fetch-activities", {
             method: "POST",
@@ -370,24 +567,33 @@
             }),
           });
 
-          const data = await res.json();
           if (!res.ok) {
-            showStatus(`Error: ${data.error || "Unknown error"}`, "error");
+            const data = await res.json().catch(() => ({}));
+            showStatus(`Error: ${data.error || res.statusText}`, "error");
             return;
           }
 
-          document.getElementById("compactText").textContent = data.compact;
-          document.getElementById("detailedText").textContent = data.formatted;
-          document.getElementById("countBadge").textContent =
-            `${data.count} activities`;
-          document.getElementById("outputSection").style.display = "grid";
-          showStatus(`Done! Extracted ${data.count} activities.`, "success");
+          resetOutput();
           document
-            .getElementById("outputSection")
+            .getElementById("statusMsg")
             .scrollIntoView({ behavior: "smooth", block: "start" });
+
+          await readEvents(res, (ev) => {
+            if (ev.type === "done" || ev.type === "error") finished = true;
+            handleEvent(ev);
+          });
+
+          if (!finished) {
+            logLine("✗ Connection to the local server closed unexpectedly", "error");
+            showStatus(
+              "Connection to the local server closed unexpectedly — results may be incomplete.",
+              "error",
+            );
+          }
         } catch (err) {
           showStatus(`Unexpected error: ${err.message}`, "error");
         } finally {
+          stopCountdown();
           btn.disabled = false;
           btn.textContent = "Extract Activities";
         }
